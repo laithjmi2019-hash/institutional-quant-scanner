@@ -391,6 +391,92 @@ def fetch_tier2_data(row, strategy):
         'FVG_Details': fvg_det
     }
 
+def fetch_tier2_data_omni(row):
+    ticker_str = row['Ticker']
+    rs_base_score = row['RS_Base_Score']
+    rsi = row['RSI']
+    
+    tk = yf.Ticker(ticker_str)
+    
+    try: info = tk.info
+    except: info = {}
+        
+    earnings_risk = False
+    earnings_date = None
+    try:
+        cal = tk.calendar
+        if isinstance(cal, dict) and 'Earnings Date' in cal:
+            dates = cal['Earnings Date']
+            if len(dates) > 0: earnings_date = dates[0]
+    except: pass
+
+    if earnings_date is None:
+        try:
+            edates = tk.get_earnings_dates()
+            if edates is not None and not edates.empty:
+                future_dates = edates[edates.index > datetime.now(timezone.utc)]
+                if not future_dates.empty: earnings_date = future_dates.index.min()
+        except: pass
+        
+    if earnings_date is not None:
+        try:
+            days_to_earnings = (earnings_date.replace(tzinfo=None) - datetime.now()).days
+            if 0 <= days_to_earnings <= 7:
+                earnings_risk = True
+        except: pass
+
+    fund_scores = score_fundamentals(info)
+    
+    try:
+        hist_1h = tk.history(period="60d", interval="1h")
+        sweep_1h, mss_1h, fvg_1h, fvg_det, tp1, tp2 = analyze_smc(hist_1h)
+    except:
+        sweep_1h, mss_1h, fvg_1h, fvg_det, tp1, tp2 = False, False, False, {}, None, None
+        
+    tech_flags = (sweep_1h, mss_1h, fvg_1h)
+    
+    ALL_STRATEGIES = [
+        "Deep Value Reversion",
+        "Structural Pullback",
+        "Accumulation Spring",
+        "Momentum Breakout",
+        "Bearish Distribution (Shorting)"
+    ]
+    
+    results = {}
+    for strat in ALL_STRATEGIES:
+        comp_score = calculate_strategy_score(strat, tech_flags, rsi, rs_base_score, fund_scores, info)
+        if earnings_risk:
+            comp_score -= 30
+            
+        rec = "AVOID"
+        if comp_score >= 80: rec = "STRONG BUY"
+        elif comp_score >= 65: rec = "BUY"
+        elif comp_score >= 40: rec = "HOLD"
+        
+        results[strat] = {
+            'Ticker': ticker_str,
+            'Company Name': info.get('longName', ticker_str),
+            'Sector': info.get('sector', 'Unknown'),
+            'Composite Score': round(comp_score, 1),
+            'Recommendation': rec,
+            'Fund: Solvency': fund_scores['Solvency'],
+            'Fund: Profitability': fund_scores['Profitability'],
+            'Fund: Growth': fund_scores['Growth'],
+            'Fund: Valuation': fund_scores['Valuation'],
+            'Tech: RS Base': round(rs_base_score, 1),
+            'Swept Liquidity': sweep_1h,
+            'MSS Triggered': mss_1h,
+            'In FVG Zone': fvg_1h,
+            'Earnings Risk': earnings_risk,
+            'RSI': round(rsi, 1),
+            'TP1': tp1,
+            'TP2': tp2,
+            'FVG_Details': fvg_det
+        }
+        
+    return results
+
 # ---------------------------------------------------------
 # WEBHOOK AUTOMATION
 # ---------------------------------------------------------
@@ -528,37 +614,59 @@ if __name__ == "__main__":
                     pass
                     
                 row = {'Ticker': search_ticker, 'RS_Base_Score': 20.0, 'RSI': actual_rsi}
-                res = fetch_tier2_data(row, STRATEGY)
+                results = fetch_tier2_data_omni(row)
                 
-                if res['Earnings Risk']:
-                    st.error(f"⚠️ EARNINGS RISK: {search_ticker} reports earnings within the next 7 days. -30 Penalty Applied.")
+                # Identify Dominant Setup
+                dominant_strategy = max(results.keys(), key=lambda k: results[k]['Composite Score'])
+                dominant_res = results[dominant_strategy]
+                max_score = dominant_res['Composite Score']
                 
-                st.subheader(f"{res['Company Name']} ({res['Ticker']}) - {res['Sector']}")
+                if dominant_res['Earnings Risk']:
+                    st.error(f"⚠️ EARNINGS RISK: {search_ticker} reports earnings within the next 7 days. -30 Penalty Applied to all scores.")
                 
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Composite Score", f"{res['Composite Score']} / 100")
-                col2.metric("Recommendation", res['Recommendation'])
-                col3.metric("Swept Liquidity", "Yes" if res['Swept Liquidity'] else "No")
-                col4.metric("MSS Triggered", "Yes" if res['MSS Triggered'] else "No")
+                st.subheader(f"{dominant_res['Company Name']} ({dominant_res['Ticker']}) - {dominant_res['Sector']}")
                 
-                with st.expander("Institutional Exits & Position Sizing"):
-                    fvg = res['FVG_Details']
-                    if res['In FVG Zone'] and fvg:
-                        st.write(f"**Active FVG Detected ({fvg['Type']})**")
-                        entry = fvg['Top'] if fvg['Type'] == 'Bullish' else fvg['Bottom']
-                        stop = fvg['Bottom'] if fvg['Type'] == 'Bullish' else fvg['Top']
-                        st.write(f"- FVG Entry Boundary: {entry:.2f}")
-                        st.write(f"- FVG Invalidation (Stop Loss): {stop:.2f}")
-                        
-                        risk_amt = portfolio_size * (risk_pct / 100.0)
-                        risk_per_share = abs(entry - stop)
-                        if risk_per_share > 0:
-                            allowed_shares = int(risk_amt / risk_per_share)
-                            st.success(f"**Allowed Position Size:** {allowed_shares} shares (Risking ${risk_amt:.2f})")
-                        
-                        st.write("---")
-                        st.write("**Take-Profit Targets (Un-swept Liquidity):**")
-                        st.write(f"- **TP1:** {res['TP1']:.2f}" if res['TP1'] else "- **TP1:** None found")
-                        st.write(f"- **TP2:** {res['TP2']:.2f}" if res['TP2'] else "- **TP2:** None found")
-                    else:
-                        st.write("No active Fair Value Gap zone detected. Position sizing requires an FVG boundary.")
+                st.markdown("### 🔍 Omni-Scan Comparative Analysis")
+                cols = st.columns(len(results.keys()))
+                for i, strat in enumerate(results.keys()):
+                    score = results[strat]['Composite Score']
+                    with cols[i]:
+                        # Shorten name for UI fit if needed
+                        display_name = strat.replace(" (Shorting)", "").replace(" ", "\n")
+                        st.metric(strat.split(" ")[0], f"{score}/100", help=strat)
+                
+                st.markdown("---")
+                
+                if max_score < 70:
+                    st.warning(f"**No Dominant Institutional Setup Detected.** The highest scoring strategy was *{dominant_strategy}* at {max_score}/100. Position sizing and Take-Profit generation halted.")
+                else:
+                    st.success(f"**Dominant Setup Detected:** {dominant_strategy} ({max_score}/100)")
+                    
+                    st.markdown("### Technical & Fundamental Breakdown")
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("Recommendation", dominant_res['Recommendation'])
+                    col2.metric("Swept Liquidity", "Yes" if dominant_res['Swept Liquidity'] else "No")
+                    col3.metric("MSS Triggered", "Yes" if dominant_res['MSS Triggered'] else "No")
+                    col4.metric("In FVG Zone", "Yes" if dominant_res['In FVG Zone'] else "No")
+                    
+                    with st.expander("Institutional Exits & Position Sizing", expanded=True):
+                        fvg = dominant_res['FVG_Details']
+                        if dominant_res['In FVG Zone'] and fvg:
+                            st.write(f"**Active FVG Detected ({fvg['Type']})**")
+                            entry = fvg['Top'] if fvg['Type'] == 'Bullish' else fvg['Bottom']
+                            stop = fvg['Bottom'] if fvg['Type'] == 'Bullish' else fvg['Top']
+                            st.write(f"- FVG Entry Boundary: {entry:.2f}")
+                            st.write(f"- FVG Invalidation (Stop Loss): {stop:.2f}")
+                            
+                            risk_amt = portfolio_size * (risk_pct / 100.0)
+                            risk_per_share = abs(entry - stop)
+                            if risk_per_share > 0:
+                                allowed_shares = int(risk_amt / risk_per_share)
+                                st.success(f"**Allowed Position Size:** {allowed_shares} shares (Risking ${risk_amt:.2f})")
+                            
+                            st.write("---")
+                            st.write("**Take-Profit Targets (Un-swept Liquidity):**")
+                            st.write(f"- **TP1:** {dominant_res['TP1']:.2f}" if dominant_res['TP1'] else "- **TP1:** None found")
+                            st.write(f"- **TP2:** {dominant_res['TP2']:.2f}" if dominant_res['TP2'] else "- **TP2:** None found")
+                        else:
+                            st.write("No active Fair Value Gap zone detected for the dominant setup. Position sizing requires an FVG boundary.")
