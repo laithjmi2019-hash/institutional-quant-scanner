@@ -255,7 +255,7 @@ def calculate_strategy_score(strategy, tech_flags, rsi, rs_score, fund_scores, i
         if mss: score += 30  # Assuming mss logic flags bearish if we passed it correctly
         if fvg: score += 20
         
-    return min(100, score)
+    return max(0, min(100, score))
 
 # ---------------------------------------------------------
 # TIER 1 & TIER 2 PIPELINE
@@ -514,7 +514,20 @@ if __name__ == "__main__":
             risk_pct = col_ps2.number_input("Risk Per Trade (%)", value=1.0, step=0.1)
             
             with st.spinner(f"Analyzing {search_ticker} against {STRATEGY}..."):
-                row = {'Ticker': search_ticker, 'RS_Base_Score': 20.0, 'RSI': 50.0}
+                # Fetch actual RSI for Tab 2 to avoid hard-gating dummy penalties
+                actual_rsi = 50.0
+                try:
+                    hist_1d = yf.Ticker(search_ticker).history(period="90d", interval="1d")
+                    if not hist_1d.empty:
+                        delta = hist_1d['Close'].diff()
+                        gain = delta.clip(lower=0)
+                        loss = -1 * delta.clip(upper=0)
+                        rs = gain.ewm(com=13, adjust=False).mean() / loss.ewm(com=13, adjust=False).mean()
+                        actual_rsi = float((100 - (100 / (1 + rs))).iloc[-1])
+                except:
+                    pass
+                    
+                row = {'Ticker': search_ticker, 'RS_Base_Score': 20.0, 'RSI': actual_rsi}
                 res = fetch_tier2_data(row, STRATEGY)
                 
                 if res['Earnings Risk']:
