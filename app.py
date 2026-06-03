@@ -349,14 +349,16 @@ def run_tier_1():
         spy_close = spy_data['Close']
         
     spy_ret = spy_close.pct_change(60).iloc[-1]
+    if isinstance(spy_ret, pd.Series): spy_ret = float(spy_ret.iloc[0])
+    else: spy_ret = float(spy_ret)
     
     tier1_results = []
     for ticker in universe:
         try:
             if isinstance(data.columns, pd.MultiIndex):
-                df = data[ticker]
+                df = data[ticker].dropna()
             else:
-                if len(universe) == 1: df = data
+                if len(universe) == 1: df = data.dropna()
                 else: continue
                 
             if df.empty or len(df) < 60: continue
@@ -365,8 +367,11 @@ def run_tier_1():
             v = df['Volume']
             
             stock_ret = c.pct_change(60).iloc[-1]
+            if isinstance(stock_ret, pd.Series): stock_ret = float(stock_ret.iloc[0])
+            else: stock_ret = float(stock_ret)
+            
             rs_score = ((stock_ret - spy_ret) / abs(spy_ret)) * 100 if spy_ret != 0 else 0
-            avg_vol = v.rolling(20).mean().iloc[-1]
+            avg_vol = float(v.rolling(20).mean().iloc[-1])
             
             if avg_vol > 500000:
                 tier1_results.append({'Ticker': ticker, 'RS': rs_score, 'AvgVol': avg_vol})
