@@ -278,8 +278,20 @@ def fetch_daily_data(ticker):
     except:
         return None, {}, []
 
-def evaluate_ticker_pipeline(ticker):
-    df_1d, info, news = fetch_daily_data(ticker)
+def evaluate_ticker_pipeline(ticker, preloaded_df=None):
+    if preloaded_df is not None:
+        df_1d = preloaded_df.dropna()
+        info = {}
+        news = []
+        try:
+            tk = yf.Ticker(ticker)
+            info = tk.info
+            news = tk.news
+        except:
+            pass
+    else:
+        df_1d, info, news = fetch_daily_data(ticker)
+        
     if df_1d is None or len(df_1d) < 200: return None
     
     s1_score, s1_flag, s1_det = run_strategy_1_rvol(df_1d)
@@ -329,7 +341,7 @@ def run_tier_1():
         data = yf.download(universe, period="1y", interval="1d", group_by='ticker', auto_adjust=False, progress=False)
         spy_data = yf.download("SPY", period="1y", interval="1d", auto_adjust=False, progress=False)
     except:
-        return []
+        return [], None
         
     if isinstance(spy_data.columns, pd.MultiIndex):
         spy_close = spy_data[('Close', 'SPY')]
@@ -362,10 +374,10 @@ def run_tier_1():
             pass
             
     tier1_df = pd.DataFrame(tier1_results)
-    if tier1_df.empty: return []
+    if tier1_df.empty: return [], None
     
     tier1_df = tier1_df.sort_values(by='RS', ascending=False).head(100)
-    return tier1_df['Ticker'].tolist()
+    return tier1_df['Ticker'].tolist(), data
 
 # ---------------------------------------------------------
 # WEBHOOK AUTOMATION
@@ -379,12 +391,21 @@ def trigger_webhook(payload):
 
 def run_headless_pipeline():
     print(f"--- HEADLESS QUANT SCAN INITIATED ---")
-    tier2_tickers = run_tier_1()
+    tier2_tickers, preloaded_data = run_tier_1()
     print(f"Tier 1 completed. Processing {len(tier2_tickers)} tickers in Tier 2...")
     
     final_results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        future_to_ticker = {executor.submit(evaluate_ticker_pipeline, t): t for t in tier2_tickers}
+        future_to_ticker = {}
+        for t in tier2_tickers:
+            df_preload = None
+            if preloaded_data is not None:
+                if isinstance(preloaded_data.columns, pd.MultiIndex):
+                    df_preload = preloaded_data[t]
+                else:
+                    df_preload = preloaded_data
+            future_to_ticker[executor.submit(evaluate_ticker_pipeline, t, df_preload)] = t
+            
         for future in concurrent.futures.as_completed(future_to_ticker):
             try:
                 res = future.result()
@@ -420,7 +441,7 @@ with st.sidebar:
 
 if 'run_scan' in st.session_state and st.session_state['run_scan']:
     with tab1:
-        tier2_tickers = run_tier_1()
+        tier2_tickers, preloaded_data = run_tier_1()
         if not tier2_tickers:
             st.warning("Tier 1 failed or no tickers found.")
         else:
@@ -432,7 +453,16 @@ if 'run_scan' in st.session_state and st.session_state['run_scan']:
             total = len(tier2_tickers)
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-                future_to_ticker = {executor.submit(evaluate_ticker_pipeline, t): t for t in tier2_tickers}
+                future_to_ticker = {}
+                for t in tier2_tickers:
+                    df_preload = None
+                    if preloaded_data is not None:
+                        if isinstance(preloaded_data.columns, pd.MultiIndex):
+                            df_preload = preloaded_data[t]
+                        else:
+                            df_preload = preloaded_data
+                    future_to_ticker[executor.submit(evaluate_ticker_pipeline, t, df_preload)] = t
+                    
                 for future in concurrent.futures.as_completed(future_to_ticker):
                     completed += 1
                     status_text.text(f"Processing Tier 2: {completed}/{total}")
