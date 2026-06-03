@@ -2,6 +2,7 @@ import sys
 import argparse
 import requests
 from datetime import datetime, timedelta, timezone
+import json
 import concurrent.futures
 import pandas as pd
 import numpy as np
@@ -9,6 +10,13 @@ import yfinance as yf
 import streamlit as st
 import plotly.express as px
 import tickers
+
+# Load Local Sector Cache
+try:
+    with open('sectors.json', 'r') as f:
+        SECTOR_MAP = json.load(f)
+except:
+    SECTOR_MAP = {}
 
 # ---------------------------------------------------------
 # CONSTANTS & CONFIGURATION
@@ -254,18 +262,17 @@ def run_strategy_5_fundamental(ticker, news_data):
 # AGGREGATION & DATA PIPELINE
 # ---------------------------------------------------------
 def aggregate_alpha_score(scores, flags_dict, is_risk_on):
-    if is_risk_on:
-        weights = {'Volume': 0.35, 'AVWAP': 0.25, 'Trend': 0.30, 'Fund': 0.10}
-    else:
-        weights = {'Volume': 0.30, 'AVWAP': 0.40, 'Trend': 0.10, 'Fund': 0.20}
+    # Core Alpha Base (100% Quantitative)
+    # RVOL (40%), Fast Momentum (40%), Squeeze (20%)
+    weights = {'Volume': 0.40, 'Trend': 0.40, 'Squeeze': 0.20}
         
     alpha = 0
     for k, v in weights.items():
-        alpha += scores[k] * v
+        alpha += scores.get(k, 0) * v
         
-    # Bonus Multiplier for Squeeze + RVOL
-    if flags_dict['Squeeze'] and flags_dict['Volume']:
-        alpha += 15
+    # Structural Hard Gate
+    if not flags_dict.get('AVWAP', False):
+        alpha = 0
         
     return min(100.0, round(alpha, 1))
 
@@ -282,16 +289,10 @@ def fetch_daily_data(ticker):
 def evaluate_ticker_pipeline(ticker, preloaded_df=None):
     if preloaded_df is not None:
         df_1d = preloaded_df.dropna()
-        info = {}
-        news = []
-        try:
-            tk = yf.Ticker(ticker)
-            info = tk.info
-            news = tk.news
-        except:
-            pass
+        sector = SECTOR_MAP.get(ticker, 'Unknown')
     else:
-        df_1d, info, news = fetch_daily_data(ticker)
+        df_1d, info, _ = fetch_daily_data(ticker)
+        sector = info.get('sector', 'Unknown')
         
     if df_1d is None or len(df_1d) < 200: return None
     
@@ -299,16 +300,16 @@ def evaluate_ticker_pipeline(ticker, preloaded_df=None):
     s2_score, s2_flag, s2_det = run_strategy_2_squeeze(df_1d)
     s3_score, s3_flag, s3_det = run_strategy_3_avwap(df_1d)
     s4_score, s4_flag, s4_det = run_strategy_4_trend(df_1d)
-    s5_score, s5_flag, s5_det = run_strategy_5_fundamental(ticker, news)
     
-    scores = {'Volume': s1_score, 'AVWAP': s3_score, 'Trend': s4_score, 'Fund': s5_score}
-    flags_dict = {'Volume': s1_flag, 'Squeeze': s2_flag}
+    # Quantitative only
+    scores = {'Volume': s1_score, 'Squeeze': s2_score, 'Trend': s4_score}
+    flags_dict = {'Volume': s1_flag, 'Squeeze': s2_flag, 'AVWAP': s3_flag, 'Trend': s4_flag}
     alpha = aggregate_alpha_score(scores, flags_dict, is_risk_on)
     
     rec = "AVOID"
-    if alpha >= 80: rec = "STRONG BUY"
-    elif alpha >= 65: rec = "BUY"
-    elif alpha >= 40: rec = "HOLD"
+    if alpha > 80: rec = "STRONG BUY"
+    elif alpha > 65: rec = "BUY"
+    elif alpha > 40: rec = "HOLD"
     
     atr_series, _ = calc_atr(df_1d, 14)
     current_atr = float(atr_series.iloc[-1])
@@ -316,17 +317,23 @@ def evaluate_ticker_pipeline(ticker, preloaded_df=None):
     
     return {
         'Ticker': ticker,
-        'Company Name': info.get('longName', ticker),
-        'Sector': info.get('sector', 'Unknown'),
+        'Company Name': tickers.TICKER_MAPPING.get(ticker, ticker),
+        'Sector': sector,
         'Alpha Score': alpha,
         'Recommendation': rec,
         'RVOL Spike': s1_flag,
         'Squeeze Active': s2_flag,
         'QTD AVWAP': s3_flag,
         'Trend Expansion': s4_flag,
-        'Catalyst': s5_flag,
-        'Details': {'Volume': s1_det, 'Squeeze': s2_det, 'AVWAP': s3_det, 'Trend': s4_det, 'Fund': s5_det},
-        'Scores': {'Volume': s1_score, 'Squeeze': s2_score, 'AVWAP': s3_score, 'Trend': s4_score, 'Fund': s5_score},
+        'Catalyst': False, # Moved to Deep Dive
+        'Details': {
+            'Volume': s1_det, 
+            'Squeeze': s2_det, 
+            'AVWAP': s3_det, 
+            'Trend': s4_det, 
+            'Fund': "Execute Deep-Dive to scan News"
+        },
+        'Scores': {'Volume': s1_score, 'Squeeze': s2_score, 'AVWAP': s3_score, 'Trend': s4_score, 'Fund': 0},
         'ATR': current_atr,
         'Current Price': current_price
     }
@@ -509,8 +516,19 @@ with tab2:
             if not res:
                 st.error("Failed to evaluate ticker. Not enough data.")
             else:
+                # Isolate Strategy 5 Execution (Only for Deep-Dive)
+                try:
+                    tk = yf.Ticker(search_ticker)
+                    news_data = tk.news
+                except:
+                    news_data = []
+                s5_score, s5_flag, s5_det = run_strategy_5_fundamental(search_ticker, news_data)
+                res['Scores']['Fund'] = s5_score
+                res['Details']['Fund'] = s5_det
+                res['Catalyst'] = s5_flag
+                
                 st.subheader(f"{res['Company Name']} ({res['Ticker']}) - {res['Sector']}")
-                st.metric("Institutional Alpha Score", f"{res['Alpha Score']} / 100", help="Weighted average of all 5 daily engines")
+                st.metric("Institutional Alpha Score (Core + Squeeze)", f"{res['Alpha Score']} / 100", help="Weighted core momentum score")
                 
                 st.markdown("### 🔍 5-Engine Matrix Breakdown")
                 cols = st.columns(5)
