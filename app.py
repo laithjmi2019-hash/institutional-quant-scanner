@@ -6,476 +6,392 @@ import concurrent.futures
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import streamlit as st
 import tickers
 
 # ---------------------------------------------------------
-# ARGPARSE & HEADLESS MODE SETUP
+# CONSTANTS & CONFIGURATION
 # ---------------------------------------------------------
-parser = argparse.ArgumentParser(description="Quantitative Trading Scanner")
-parser.add_argument("--headless", action="store_true", help="Run in headless mode without Streamlit UI")
-parser.add_argument("--strategy", type=str, default="Deep Value Reversion", help="Strategy to use in headless mode")
-args, unknown = parser.parse_known_args()
-
-HEADLESS_MODE = args.headless
-DEFAULT_STRATEGY = args.strategy
-
-if HEADLESS_MODE:
-    from unittest.mock import MagicMock
-    st = MagicMock()
-    
-    # Mock Streamlit decorators so they return the original function instead of a MagicMock
-    def mock_decorator(*args, **kwargs):
-        def wrapper(func):
-            return func
-        return wrapper
-    
-    st.cache_data = mock_decorator
-else:
-    import streamlit as st
-
+WEBHOOK_URL = "LOCAL_PLACEHOLDER"
 try:
-    WEBHOOK_URL = st.secrets["WEBHOOK_URL"]
+    if "WEBHOOK_URL" in st.secrets:
+        WEBHOOK_URL = st.secrets["WEBHOOK_URL"]
 except Exception:
-    WEBHOOK_URL = "LOCAL_PLACEHOLDER"
+    pass
+
+st.set_page_config(layout="wide", page_title="Institutional Quant Scanner")
+
+# Argparse headless setup
+parser = argparse.ArgumentParser()
+parser.add_argument('--headless', action='store_true', help='Run headless background scan')
+args, unknown = parser.parse_known_args()
+HEADLESS_MODE = args.headless
 
 # ---------------------------------------------------------
-# GLOBAL MARKET REGIME FILTER
+# GLOBAL MARKET REGIME
 # ---------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=3600)
 def get_market_regime():
-    """
-    Returns (vix_val, spy_price, spy_sma20, is_risk_on)
-    """
     try:
-        data = yf.download(["^VIX", "SPY"], period="40d", interval="1d", group_by="ticker", threads=True, auto_adjust=False)
-        vix_close = data["^VIX"]["Close"].dropna()
-        spy_close = data["SPY"]["Close"].dropna()
+        spy_df = yf.download("SPY", period="1y", interval="1d", auto_adjust=False, progress=False)
+        vix_df = yf.download("^VIX", period="10d", interval="1d", auto_adjust=False, progress=False)
         
-        if vix_close.empty or spy_close.empty:
-            print("Warning: Market regime data empty. Defaulting to Risk-On.")
-            return 0.0, 0.0, 0.0, True
-            
-        vix_val = vix_close.iloc[-1]
-        spy_price = spy_close.iloc[-1]
-        spy_sma20 = spy_close.tail(20).mean()
+        if spy_df.empty or vix_df.empty: return 0.0, 0.0, 0.0, True
         
-        is_risk_on = not (vix_val > 25 or spy_price < spy_sma20)
+        vix_val = float(vix_df['Close'].iloc[-1].iloc[0]) if isinstance(vix_df['Close'], pd.DataFrame) else float(vix_df['Close'].iloc[-1])
+        spy_price = float(spy_df['Close'].iloc[-1].iloc[0]) if isinstance(spy_df['Close'], pd.DataFrame) else float(spy_df['Close'].iloc[-1])
+        spy_sma20 = float(spy_df['Close'].rolling(20).mean().iloc[-1].iloc[0]) if isinstance(spy_df['Close'], pd.DataFrame) else float(spy_df['Close'].rolling(20).mean().iloc[-1])
+        
+        is_risk_on = (vix_val <= 25) and (spy_price >= spy_sma20)
         return vix_val, spy_price, spy_sma20, is_risk_on
     except Exception as e:
-        print(f"Warning: Exception fetching market regime data ({e}). Defaulting to Risk-On.")
+        print(f"Market regime fetch failed: {e}")
         return 0.0, 0.0, 0.0, True
 
 vix_val, spy_price, spy_sma20, is_risk_on = get_market_regime()
 
-if not HEADLESS_MODE:
-    st.set_page_config(layout="wide", page_title="Institutional Quant Scanner")
+# ---------------------------------------------------------
+# VECTORIZED MATH INDICATORS
+# ---------------------------------------------------------
+def calc_atr(df, period=14):
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = np.max(ranges, axis=1)
+    return true_range.rolling(period).mean(), true_range
+
+def calc_bb(df, period=20, std=2):
+    sma = df['Close'].rolling(period).mean()
+    std_dev = df['Close'].rolling(period).std()
+    upper = sma + (std * std_dev)
+    lower = sma - (std * std_dev)
+    return upper, lower
+
+def calc_kc(df, period=20, atr_mult=1.5):
+    ema = df['Close'].ewm(span=period, adjust=False).mean()
+    atr, _ = calc_atr(df, period)
+    upper = ema + (atr_mult * atr)
+    lower = ema - (atr_mult * atr)
+    return upper, lower
+
+def calc_adx(df, period=14):
+    atr, tr = calc_atr(df, period)
+    up_move = df['High'] - df['High'].shift(1)
+    down_move = df['Low'].shift(1) - df['Low']
     
-    if is_risk_on:
-        st.success(f"**Risk-On Regime.** VIX: {vix_val:.2f} | SPY Price: {spy_price:.2f} (SMA20: {spy_sma20:.2f}). Momentum and Pullback strategies optimized.")
-    else:
-        st.error(f"**WARNING: Risk-Off Regime detected.** VIX: {vix_val:.2f} | SPY Price: {spy_price:.2f} (SMA20: {spy_sma20:.2f}). Breakout strategies carry high failure probability. Prioritize Deep Value or Bearish Distribution.")
-        
-    st.sidebar.header("The 5-Strategy Institutional Playbook")
-    STRATEGY = st.sidebar.selectbox(
-        "Select Trading Strategy",
-        [
-            "Deep Value Reversion",
-            "Structural Pullback",
-            "Accumulation Spring",
-            "Momentum Breakout",
-            "Bearish Distribution (Shorting)"
-        ]
-    )
-else:
-    STRATEGY = DEFAULT_STRATEGY
+    pos_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+    neg_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+    
+    pos_dm_ser = pd.Series(pos_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean()
+    neg_dm_ser = pd.Series(neg_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean()
+    atr_ewm = tr.ewm(alpha=1/period, adjust=False).mean()
+    
+    pdi = 100 * (pos_dm_ser / atr_ewm)
+    ndi = 100 * (neg_dm_ser / atr_ewm)
+    
+    dx = 100 * np.abs(pdi - ndi) / (pdi + ndi)
+    adx = dx.ewm(alpha=1/period, adjust=False).mean()
+    return adx, pdi, ndi
 
 # ---------------------------------------------------------
-# SMC ENGINE & RVOL VALIDATION
+# STRATEGY 1: VOLUME ABSORPTION
 # ---------------------------------------------------------
-def analyze_smc(df):
-    """
-    Computes RVOL, SMC flags (Sweep, MSS, FVG), and Exits (TP1, TP2).
-    """
-    if df is None or len(df) < 25:
-        return False, False, False, {}, None, None
-        
-    df['Swing_High_20'] = df['High'].shift(1).rolling(window=20).max()
-    df['Swing_Low_20'] = df['Low'].shift(1).rolling(window=20).min()
+def run_strategy_1_absorption(df_1d):
+    if df_1d is None or len(df_1d) < 30: return 0, False, "Not enough data"
+    vol_sma = df_1d['Volume'].rolling(30).mean()
+    atr, tr = calc_atr(df_1d, 30)
     
-    # 1. Volume Validation (RVOL)
-    if 'Volume' in df.columns:
-        df['Volume_SMA_20'] = df['Volume'].shift(1).rolling(window=20).mean()
-        df['RVOL'] = np.where(df['Volume_SMA_20'] > 0, df['Volume'] / df['Volume_SMA_20'], 1.0)
-    else:
-        df['RVOL'] = 1.0
-        
-    # Liquidity Sweep
-    df['Bearish_Sweep'] = (df['High'] > df['Swing_High_20']) & (df['Close'] < df['Swing_High_20'])
-    df['Bullish_Sweep'] = (df['Low'] < df['Swing_Low_20']) & (df['Close'] > df['Swing_Low_20'])
-    sweep_triggered = df['Bearish_Sweep'].iloc[-1] or df['Bullish_Sweep'].iloc[-1]
+    current_vol = df_1d['Volume'].iloc[-1]
+    current_vol_sma = vol_sma.iloc[-1]
+    current_tr = tr.iloc[-1]
     
-    # Market Structure Shift (MSS) with RVOL Validation
-    df['Bullish_MSS'] = (df['Close'] > df['Swing_High_20']) & (df['RVOL'] > 1.5)
-    df['Bearish_MSS'] = (df['Close'] < df['Swing_Low_20']) & (df['RVOL'] > 1.5)
-    mss_triggered = df['Bullish_MSS'].iloc[-1] or df['Bearish_MSS'].iloc[-1]
-    mss_rvol = df['RVOL'].iloc[-1] if mss_triggered else 0
-    
-    # FVG Detector
-    df['Bullish_FVG_Gap'] = df['Low'] > df['High'].shift(2)
-    df['Bearish_FVG_Gap'] = df['High'] < df['Low'].shift(2)
-    
-    in_fvg_zone = False
-    fvg_details = {}
-    current_price = df['Close'].iloc[-1]
-    
-    tp1, tp2 = None, None
-    
-    for i in range(1, min(10, len(df))):
-        idx = -i
-        if df['Bullish_FVG_Gap'].iloc[idx]:
-            gap_bottom = df['High'].iloc[idx - 2]
-            gap_top = df['Low'].iloc[idx]
-            if gap_bottom <= current_price <= gap_top:
-                in_fvg_zone = True
-                fvg_details = {'Type': 'Bullish', 'Top': gap_top, 'Bottom': gap_bottom}
-                
-                # Exits: Nearest two un-swept swing highs above current price
-                highs = df['Swing_High_20'].dropna().unique()
-                valid_highs = sorted([h for h in highs if h > current_price])
-                if len(valid_highs) > 0: tp1 = valid_highs[0]
-                if len(valid_highs) > 1: tp2 = valid_highs[1]
-                break
-                
-        elif df['Bearish_FVG_Gap'].iloc[idx]:
-            gap_top = df['Low'].iloc[idx - 2]
-            gap_bottom = df['High'].iloc[idx]
-            if gap_bottom <= current_price <= gap_top:
-                in_fvg_zone = True
-                fvg_details = {'Type': 'Bearish', 'Top': gap_top, 'Bottom': gap_bottom}
-                
-                # Exits: Nearest two un-swept swing lows below current price
-                lows = df['Swing_Low_20'].dropna().unique()
-                valid_lows = sorted([l for l in lows if l < current_price], reverse=True)
-                if len(valid_lows) > 0: tp1 = valid_lows[0]
-                if len(valid_lows) > 1: tp2 = valid_lows[1]
-                break
-
-    return bool(sweep_triggered), bool(mss_triggered), bool(in_fvg_zone), fvg_details, tp1, tp2
-
-# ---------------------------------------------------------
-# FUNDAMENTALS & COMPOSITE SCORING
-# ---------------------------------------------------------
-def score_fundamentals(info):
-    scores = {'Solvency': 0, 'Profitability': 0, 'Growth': 0, 'Valuation': 0}
-    if not info: return scores
-    
-    try:
-        if info.get('currentRatio', 0) > 1.5: scores['Solvency'] += 10
-    except: pass
-    
-    try:
-        de = info.get('debtToEquity', 999)
-        val = de / 100 if de > 10 else de
-        if val < 1.0: scores['Solvency'] += 10
-    except: pass
-
-    try:
-        fcf_yield = info.get('freeCashflow', 0) / info.get('marketCap', 1)
-        if fcf_yield > 0.05: scores['Profitability'] += 10
-    except: pass
-    
-    try:
-        if info.get('operatingMargins', 0) > 0.15: scores['Profitability'] += 10
-    except: pass
-
-    try:
-        if info.get('revenueGrowth', 0) > 0: scores['Growth'] += 10
-    except: pass
-    
-    try:
-        if info.get('earningsGrowth', 0) > 0: scores['Growth'] += 10
-    except: pass
-
-    try:
-        if info.get('trailingPE', 999) < 25: scores['Valuation'] += 10
-    except: pass
-
-    return scores
-
-def calculate_strategy_score(strategy, tech_flags, rsi, rs_score, fund_scores, info):
-    """
-    Dynamic 100-point scoring based on the 5-Strategy Institutional Playbook.
-    """
-    sweep, mss, fvg = tech_flags
-    solvency = fund_scores['Solvency']
-    profitability = fund_scores['Profitability']
-    growth = fund_scores['Growth']
-    valuation = fund_scores['Valuation']
-    fcf = info.get('freeCashflow', 0)
-    current_ratio = info.get('currentRatio', 0)
+    tr_30 = tr.iloc[-30:]
+    tr_25th = np.percentile(tr_30.dropna(), 25)
     
     score = 0
+    is_absorbing = False
+    details = ""
     
-    if strategy == "Deep Value Reversion":
-        if rsi < 35: score += 30
-        elif rsi > 35: score -= 40
-        if valuation == 10: score += 20
-        if fcf > 0: score += 20
-        if sweep: score += 30
+    if current_vol > (3 * current_vol_sma) and current_tr <= tr_25th:
+        is_absorbing = True
+        score = 100
+        details = "MASSIVE Volume Absorption Detected (Vol > 3x MA, TR in bottom 25th percentile)"
+    elif current_vol > (2 * current_vol_sma) and current_tr <= tr_25th:
+        score = 70
+        details = "Moderate Volume Absorption"
+    elif current_vol > current_vol_sma:
+        score = 40
+        details = "Normal Volume Activity"
+    else:
+        score = 10
+        details = "Low Volume"
         
-    elif strategy == "Structural Pullback":
-        score += min(30, rs_score * 1.2)  # High RS
-        if growth > 0: score += 20
-        if fvg: score += 50
-        
-    elif strategy == "Accumulation Spring":
-        if mss: score += 50
-        if current_ratio > 1.5: score += 30
-        score += solvency
-        
-    elif strategy == "Momentum Breakout":
-        fifty_two_high = info.get('fiftyTwoWeekHigh', 999999)
-        current_price = info.get('currentPrice', 0) or info.get('previousClose', 0)
-        # Within 5% of 52-week high
-        if current_price > 0:
-            if (fifty_two_high - current_price) / current_price < 0.05:
-                score += 40
-            else:
-                score -= 40
-        else:
-            score -= 40
-            
-        if mss: score += 30
-        if fvg: score += 30
-        
-    elif strategy == "Bearish Distribution (Shorting)":
-        if rsi > 70: score += 30
-        elif rsi < 60: score -= 40
-        if fcf < 0: score += 20
-        if mss: score += 30  # Assuming mss logic flags bearish if we passed it correctly
-        if fvg: score += 20
-        
-    return max(0, min(100, score))
+    return score, is_absorbing, details
 
 # ---------------------------------------------------------
-# TIER 1 & TIER 2 PIPELINE
+# STRATEGY 2: VOLATILITY COMPRESSION (SQUEEZE)
+# ---------------------------------------------------------
+def run_strategy_2_squeeze(df_4h):
+    if df_4h is None or len(df_4h) < 20: return 0, False, "Not enough data"
+    bb_up, bb_low = calc_bb(df_4h, 20, 2)
+    kc_up, kc_low = calc_kc(df_4h, 20, 1.5)
+    
+    bbw = (bb_up - bb_low) / df_4h['Close'].rolling(20).mean()
+    
+    squeeze_active = (bb_up.iloc[-1] < kc_up.iloc[-1]) and (bb_low.iloc[-1] > kc_low.iloc[-1])
+    bbw_min = bbw.rolling(150).min().iloc[-1] if len(bbw) > 150 else bbw.min()
+    
+    score = 0
+    details = "No Squeeze"
+    if squeeze_active:
+        score = 80
+        details = "SQUEEZE ACTIVE (BB inside KC)"
+        if bbw.iloc[-1] <= (bbw_min * 1.1):
+            score = 100
+            details = "MAXIMUM SQUEEZE ACTIVE (BBW at multi-month low)"
+    else:
+        if bbw.iloc[-1] > kc_up.iloc[-1]:
+            score = 50
+            details = "Squeeze Fired / Expansion Phase"
+            
+    return score, squeeze_active, details
+
+# ---------------------------------------------------------
+# STRATEGY 3: HIGHER-TIMEFRAME SMC ENGINE
+# ---------------------------------------------------------
+def run_strategy_3_smc(df_1h):
+    if df_1h is None or len(df_1h) < 10: return 0, False, {}, "Not enough data"
+    
+    score = 0
+    sweep_choch = False
+    fvg_det = {}
+    details = ""
+    
+    highs = df_1h['High'].values
+    lows = df_1h['Low'].values
+    closes = df_1h['Close'].values
+    
+    swing_lows = []
+    for i in range(2, len(lows)-2):
+        if lows[i] < lows[i-1] and lows[i] < lows[i-2] and lows[i] < lows[i+1] and lows[i] < lows[i+2]:
+            swing_lows.append((i, lows[i]))
+            
+    recent_lows = lows[-10:]
+    recent_closes = closes[-10:]
+    if len(swing_lows) > 0:
+        last_swing_low = swing_lows[-1][1]
+        for i in range(len(recent_lows)):
+            if recent_lows[i] < last_swing_low and recent_closes[i] > last_swing_low:
+                sweep_choch = True
+                score += 50
+                details += "Bullish Liquidity Sweep (CHoCH). "
+                break
+                
+    fvgs = []
+    for i in range(1, 4):
+        if len(df_1h) < i + 3: continue
+        c1_h = df_1h['High'].iloc[-(i+2)]
+        c3_l = df_1h['Low'].iloc[-i]
+        if c1_h < c3_l:
+            fvg_det = {'Type': 'Bullish', 'Top': c3_l, 'Bottom': c1_h}
+            score += 50
+            details += "Bullish FVG Spotted. "
+            break
+            
+    if score == 0:
+        score = 20
+        details = "No major SMC setups"
+        
+    return min(100, score), sweep_choch, fvg_det, details
+
+# ---------------------------------------------------------
+# STRATEGY 4: MACRO TREND EXPANSION
+# ---------------------------------------------------------
+def run_strategy_4_trend(df_1d):
+    if df_1d is None or len(df_1d) < 200: return 0, False, "Not enough data"
+    
+    ema20 = df_1d['Close'].ewm(span=20, adjust=False).mean()
+    ema50 = df_1d['Close'].ewm(span=50, adjust=False).mean()
+    ema100 = df_1d['Close'].ewm(span=100, adjust=False).mean()
+    ema200 = df_1d['Close'].ewm(span=200, adjust=False).mean()
+    
+    adx, pdi, ndi = calc_adx(df_1d, 14)
+    
+    c = df_1d['Close'].iloc[-1]
+    e20 = ema20.iloc[-1]
+    e50 = ema50.iloc[-1]
+    e100 = ema100.iloc[-1]
+    e200 = ema200.iloc[-1]
+    
+    cur_adx = adx.iloc[-1]
+    cur_pdi = pdi.iloc[-1]
+    cur_ndi = ndi.iloc[-1]
+    
+    is_trend = False
+    score = 0
+    details = "Sideways or Bearish"
+    
+    if c > e20 and e20 > e50 and e50 > e100 and e100 > e200:
+        if cur_adx > 25 and cur_pdi > cur_ndi:
+            is_trend = True
+            score = 100
+            details = f"Strong Bullish Expansion (ADX: {cur_adx:.1f}, +DI > -DI, Perfect EMA Ribbon)"
+        else:
+            score = 70
+            details = "Bullish EMA Ribbon but weak ADX/Momentum"
+    elif c < e20 and e20 < e50 and e50 < e100 and e100 < e200:
+        score = 0
+        details = "Bearish Expansion Ribbon"
+    else:
+        if cur_adx < 20:
+            score = 40
+            details = "Chop / Range Bound"
+            
+    return score, is_trend, details
+
+# ---------------------------------------------------------
+# STRATEGY 5: FUNDAMENTAL SCRAPER
+# ---------------------------------------------------------
+class FundamentalScraper:
+    def scrape(self, ticker, news_data):
+        raise NotImplementedError
+
+class YahooFinanceScraper(FundamentalScraper):
+    def scrape(self, ticker, news_data):
+        keywords = ["grant", "dod", "contract", "fda", "procurement", "award", "partnership", "phase"]
+        found_catalysts = []
+        
+        for article in news_data:
+            title = article.get('title', '').lower()
+            for kw in keywords:
+                if kw in title:
+                    found_catalysts.append(article.get('title'))
+                    break
+                    
+        score = 20
+        details = "No Institutional Footprint Detected"
+        if len(found_catalysts) > 0:
+            score = 100
+            details = f"Institutional Footprint: {found_catalysts[0]}"
+            
+        return score, len(found_catalysts) > 0, details
+
+def run_strategy_5_fundamental(ticker, news_data):
+    scraper = YahooFinanceScraper()
+    return scraper.scrape(ticker, news_data)
+
+# ---------------------------------------------------------
+# AGGREGATION & DATA PIPELINE
+# ---------------------------------------------------------
+def aggregate_alpha_score(scores, is_risk_on):
+    if is_risk_on:
+        weights = {'Volume': 0.25, 'Squeeze': 0.15, 'SMC': 0.15, 'Trend': 0.35, 'Fund': 0.10}
+    else:
+        weights = {'Volume': 0.20, 'Squeeze': 0.30, 'SMC': 0.35, 'Trend': 0.05, 'Fund': 0.10}
+        
+    alpha = 0
+    for k, v in weights.items():
+        alpha += scores[k] * v
+    return round(alpha, 1)
+
+def fetch_multi_tf_data(ticker):
+    tk = yf.Ticker(ticker)
+    try:
+        df_1h = tk.history(period="60d", interval="1h", auto_adjust=False)
+        df_4h = df_1h.resample('4h').agg({
+            'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+        }).dropna()
+        
+        df_1d = tk.history(period="1y", interval="1d", auto_adjust=False)
+        
+        info = tk.info
+        news = tk.news
+        return df_1h, df_4h, df_1d, info, news
+    except:
+        return None, None, None, {}, []
+
+def evaluate_ticker_pipeline(ticker):
+    df_1h, df_4h, df_1d, info, news = fetch_multi_tf_data(ticker)
+    if df_1d is None or len(df_1d) < 200: return None
+    
+    s1_score, s1_flag, s1_det = run_strategy_1_absorption(df_1d)
+    s2_score, s2_flag, s2_det = run_strategy_2_squeeze(df_4h)
+    s3_score, s3_flag, fvg_det, s3_str = run_strategy_3_smc(df_1h)
+    s4_score, s4_flag, s4_det = run_strategy_4_trend(df_1d)
+    s5_score, s5_flag, s5_det = run_strategy_5_fundamental(ticker, news)
+    
+    scores = {'Volume': s1_score, 'Squeeze': s2_score, 'SMC': s3_score, 'Trend': s4_score, 'Fund': s5_score}
+    alpha = aggregate_alpha_score(scores, is_risk_on)
+    
+    rec = "AVOID"
+    if alpha >= 80: rec = "STRONG BUY"
+    elif alpha >= 65: rec = "BUY"
+    elif alpha >= 40: rec = "HOLD"
+    
+    return {
+        'Ticker': ticker,
+        'Company Name': info.get('longName', ticker),
+        'Sector': info.get('sector', 'Unknown'),
+        'Alpha Score': alpha,
+        'Recommendation': rec,
+        'Vol Absorption': s1_flag,
+        'Squeeze Active': s2_flag,
+        'SMC Sweep/CHoCH': s3_flag,
+        'Trend Expansion': s4_flag,
+        'Catalyst': s5_flag,
+        'Details': {'Vol': s1_det, 'Squeeze': s2_det, 'SMC': s3_str, 'Trend': s4_det, 'Fund': s5_det, 'FVG': fvg_det},
+        'Scores': scores
+    }
+
+# ---------------------------------------------------------
+# TIER 1 BATCH SCANNER (PRE-FILTER)
 # ---------------------------------------------------------
 def run_tier_1():
-    st.write("Running Tier 1 Filter (Volume & RS & RSI)...")
+    st.write("Running Tier 1 Filter (Volume & Momentum)...")
     universe = tickers.ALL_TICKERS
     
     try:
-        data = yf.download(universe + ['SPY'], period='90d', interval='1d', group_by='ticker', threads=True, auto_adjust=False)
-    except Exception as e:
-        st.error(f"Error downloading bulk data: {e}")
-        return pd.DataFrame()
-
-    results = []
-    
-    spy_data = data['SPY'] if 'SPY' in data else None
-    spy_ret = 0
-    if spy_data is not None and not spy_data['Close'].dropna().empty:
-        spy_close = spy_data['Close'].dropna()
-        spy_ret = (spy_close.iloc[-1] - spy_close.iloc[0]) / spy_close.iloc[0]
-
-    for t in universe:
-        if t not in data: continue
-        t_data = data[t]
-        if t_data['Close'].dropna().empty or t_data['Volume'].dropna().empty:
-            continue
-            
-        t_close = t_data['Close'].dropna()
-        t_vol = t_data['Volume'].dropna()
-        
-        if len(t_close) < 20: continue
-            
-        adv_20 = t_vol.tail(20).mean()
-        if adv_20 < 1_000_000: continue
-            
-        t_ret = (t_close.iloc[-1] - t_close.iloc[0]) / t_close.iloc[0]
-        rs_metric = t_ret - spy_ret 
-        
-        # Calculate Daily RSI
-        delta = t_close.diff()
-        gain = delta.clip(lower=0)
-        loss = -1 * delta.clip(upper=0)
-        rs = gain.ewm(com=13, adjust=False).mean() / loss.ewm(com=13, adjust=False).mean()
-        rsi = 100 - (100 / (1 + rs))
-        current_rsi = rsi.iloc[-1] if not pd.isna(rsi.iloc[-1]) else 50
-        
-        results.append({'Ticker': t, 'RS': rs_metric, 'RSI': current_rsi})
-        
-    df_res = pd.DataFrame(results)
-    if df_res.empty: return df_res
-        
-    rs_threshold = df_res['RS'].quantile(0.3)
-    df_res = df_res[df_res['RS'] >= rs_threshold]
-    df_res = df_res.sort_values(by='RS', ascending=False).head(100)
-    df_res['RS_Base_Score'] = np.linspace(25, 5, len(df_res))
-    
-    return df_res
-
-def fetch_tier2_data(row, strategy):
-    ticker_str = row['Ticker']
-    rs_base_score = row['RS_Base_Score']
-    rsi = row['RSI']
-    
-    tk = yf.Ticker(ticker_str)
-    
-    try: info = tk.info
-    except: info = {}
-        
-    # Earnings Risk Penalty Filter
-    earnings_risk = False
-    earnings_date = None
-    try:
-        # Check calendar dict first
-        cal = tk.calendar
-        if isinstance(cal, dict) and 'Earnings Date' in cal:
-            dates = cal['Earnings Date']
-            if len(dates) > 0: earnings_date = dates[0]
-    except: pass
-
-    if earnings_date is None:
-        try:
-            edates = tk.get_earnings_dates()
-            if edates is not None and not edates.empty:
-                future_dates = edates[edates.index > datetime.now(timezone.utc)]
-                if not future_dates.empty: earnings_date = future_dates.index.min()
-        except: pass
-        
-    if earnings_date is not None:
-        try:
-            days_to_earnings = (earnings_date.replace(tzinfo=None) - datetime.now()).days
-            if 0 <= days_to_earnings <= 7:
-                earnings_risk = True
-        except: pass
-
-    fund_scores = score_fundamentals(info)
-    
-    try:
-        hist_1h = tk.history(period="60d", interval="1h")
-        sweep_1h, mss_1h, fvg_1h, fvg_det, tp1, tp2 = analyze_smc(hist_1h)
+        data = yf.download(universe, period="1y", interval="1d", group_by='ticker', auto_adjust=False, progress=False)
+        spy_data = yf.download("SPY", period="1y", interval="1d", auto_adjust=False, progress=False)
     except:
-        sweep_1h, mss_1h, fvg_1h, fvg_det, tp1, tp2 = False, False, False, {}, None, None
+        return []
         
-    tech_flags = (sweep_1h, mss_1h, fvg_1h)
-    
-    comp_score = calculate_strategy_score(strategy, tech_flags, rsi, rs_base_score, fund_scores, info)
-    if earnings_risk:
-        comp_score -= 30
+    if isinstance(spy_data.columns, pd.MultiIndex):
+        spy_close = spy_data[('Close', 'SPY')]
+    else:
+        spy_close = spy_data['Close']
         
-    rec = "AVOID"
-    if comp_score >= 80: rec = "STRONG BUY"
-    elif comp_score >= 65: rec = "BUY"
-    elif comp_score >= 40: rec = "HOLD"
+    spy_ret = spy_close.pct_change(60).iloc[-1]
     
-    return {
-        'Ticker': ticker_str,
-        'Company Name': info.get('longName', ticker_str),
-        'Sector': info.get('sector', 'Unknown'),
-        'Composite Score': round(comp_score, 1),
-        'Recommendation': rec,
-        'Fund: Solvency': fund_scores['Solvency'],
-        'Fund: Profitability': fund_scores['Profitability'],
-        'Fund: Growth': fund_scores['Growth'],
-        'Fund: Valuation': fund_scores['Valuation'],
-        'Tech: RS Base': round(rs_base_score, 1),
-        'Swept Liquidity': sweep_1h,
-        'MSS Triggered': mss_1h,
-        'In FVG Zone': fvg_1h,
-        'Earnings Risk': earnings_risk,
-        'RSI': round(rsi, 1),
-        'TP1': tp1,
-        'TP2': tp2,
-        'FVG_Details': fvg_det
-    }
-
-def fetch_tier2_data_omni(row):
-    ticker_str = row['Ticker']
-    rs_base_score = row['RS_Base_Score']
-    rsi = row['RSI']
-    
-    tk = yf.Ticker(ticker_str)
-    
-    try: info = tk.info
-    except: info = {}
-        
-    earnings_risk = False
-    earnings_date = None
-    try:
-        cal = tk.calendar
-        if isinstance(cal, dict) and 'Earnings Date' in cal:
-            dates = cal['Earnings Date']
-            if len(dates) > 0: earnings_date = dates[0]
-    except: pass
-
-    if earnings_date is None:
+    tier1_results = []
+    for ticker in universe:
         try:
-            edates = tk.get_earnings_dates()
-            if edates is not None and not edates.empty:
-                future_dates = edates[edates.index > datetime.now(timezone.utc)]
-                if not future_dates.empty: earnings_date = future_dates.index.min()
-        except: pass
-        
-    if earnings_date is not None:
-        try:
-            days_to_earnings = (earnings_date.replace(tzinfo=None) - datetime.now()).days
-            if 0 <= days_to_earnings <= 7:
-                earnings_risk = True
-        except: pass
-
-    fund_scores = score_fundamentals(info)
-    
-    try:
-        hist_1h = tk.history(period="60d", interval="1h")
-        sweep_1h, mss_1h, fvg_1h, fvg_det, tp1, tp2 = analyze_smc(hist_1h)
-    except:
-        sweep_1h, mss_1h, fvg_1h, fvg_det, tp1, tp2 = False, False, False, {}, None, None
-        
-    tech_flags = (sweep_1h, mss_1h, fvg_1h)
-    
-    ALL_STRATEGIES = [
-        "Deep Value Reversion",
-        "Structural Pullback",
-        "Accumulation Spring",
-        "Momentum Breakout",
-        "Bearish Distribution (Shorting)"
-    ]
-    
-    results = {}
-    for strat in ALL_STRATEGIES:
-        comp_score = calculate_strategy_score(strat, tech_flags, rsi, rs_base_score, fund_scores, info)
-        if earnings_risk:
-            comp_score -= 30
+            if isinstance(data.columns, pd.MultiIndex):
+                df = data[ticker]
+            else:
+                if len(universe) == 1: df = data
+                else: continue
+                
+            if df.empty or len(df) < 60: continue
             
-        rec = "AVOID"
-        if comp_score >= 80: rec = "STRONG BUY"
-        elif comp_score >= 65: rec = "BUY"
-        elif comp_score >= 40: rec = "HOLD"
-        
-        results[strat] = {
-            'Ticker': ticker_str,
-            'Company Name': info.get('longName', ticker_str),
-            'Sector': info.get('sector', 'Unknown'),
-            'Composite Score': round(comp_score, 1),
-            'Recommendation': rec,
-            'Fund: Solvency': fund_scores['Solvency'],
-            'Fund: Profitability': fund_scores['Profitability'],
-            'Fund: Growth': fund_scores['Growth'],
-            'Fund: Valuation': fund_scores['Valuation'],
-            'Tech: RS Base': round(rs_base_score, 1),
-            'Swept Liquidity': sweep_1h,
-            'MSS Triggered': mss_1h,
-            'In FVG Zone': fvg_1h,
-            'Earnings Risk': earnings_risk,
-            'RSI': round(rsi, 1),
-            'TP1': tp1,
-            'TP2': tp2,
-            'FVG_Details': fvg_det
-        }
-        
-    return results
+            c = df['Close']
+            v = df['Volume']
+            
+            stock_ret = c.pct_change(60).iloc[-1]
+            rs_score = ((stock_ret - spy_ret) / abs(spy_ret)) * 100 if spy_ret != 0 else 0
+            avg_vol = v.rolling(20).mean().iloc[-1]
+            
+            if avg_vol > 500000:
+                tier1_results.append({'Ticker': ticker, 'RS': rs_score, 'AvgVol': avg_vol})
+        except:
+            pass
+            
+    tier1_df = pd.DataFrame(tier1_results)
+    if tier1_df.empty: return []
+    
+    tier1_df = tier1_df.sort_values(by='RS', ascending=False).head(100)
+    return tier1_df['Ticker'].tolist()
 
 # ---------------------------------------------------------
 # WEBHOOK AUTOMATION
@@ -488,170 +404,125 @@ def trigger_webhook(payload):
         else: print(f"Webhook failed: {e}")
 
 def run_headless_pipeline():
-    print(f"--- HEADLESS MODE INITIATED ---")
-    print(f"Strategy: {STRATEGY}")
-    tier1_df = run_tier_1()
-    if tier1_df.empty:
-        print("Tier 1 returned empty.")
-        return
-        
-    rows = tier1_df.to_dict('records')
-    print(f"Executing Tier 2 for {len(rows)} tickers...")
+    print(f"--- HEADLESS QUANT SCAN INITIATED ---")
+    tier2_tickers = run_tier_1()
+    print(f"Tier 1 completed. Processing {len(tier2_tickers)} tickers in Tier 2...")
     
+    final_results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(fetch_tier2_data, row, STRATEGY): row for row in rows}
-        tickers_fired = 0
-        for future in concurrent.futures.as_completed(futures):
+        future_to_ticker = {executor.submit(evaluate_ticker_pipeline, t): t for t in tier2_tickers}
+        for future in concurrent.futures.as_completed(future_to_ticker):
             try:
                 res = future.result()
-                if res['Composite Score'] >= 80 and res['In FVG Zone']:
-                    # Build Webhook Payload
-                    # Position sizing based on default 50k / 1%
-                    fvg = res['FVG_Details']
-                    entry = fvg.get('Bottom') if fvg.get('Type') == 'Bullish' else fvg.get('Top')
-                    stop = fvg.get('Top') if fvg.get('Type') == 'Bullish' else fvg.get('Bottom')
-                    risk_amount = 50000 * 0.01
-                    shares = 0
-                    if entry and stop and abs(entry - stop) > 0:
-                        shares = int(risk_amount / abs(entry - stop))
-                        
-                    payload = {
-                        "Ticker": res['Ticker'],
-                        "Strategy": STRATEGY,
-                        "Score": res['Composite Score'],
-                        "FVG_Bounds": fvg,
-                        "TP1": res['TP1'],
-                        "TP2": res['TP2'],
-                        "Suggested_Shares": shares
-                    }
-                    trigger_webhook(payload)
-                    print(f"[Webhook Fired] Payload sent successfully for {res['Ticker']}")
-                    tickers_fired += 1
+                if res and res['Alpha Score'] >= 80:
+                    final_results.append(res)
+                    print(f"INSTITUTIONAL SETUP DETECTED: {res['Ticker']} (Alpha: {res['Alpha Score']})")
+                    trigger_webhook(res)
             except Exception as e:
                 pass
                 
-    if tickers_fired == 0:
-        print("[Scan Complete] 0 tickers met the strict webhook criteria for entry.")
-    else:
-        print(f"[Scan Complete] {tickers_fired} tickers met criteria and fired webhooks.")
+    print("--- HEADLESS QUANT SCAN COMPLETED ---")
+    sys.exit(0)
+
+if HEADLESS_MODE:
+    run_headless_pipeline()
 
 # ---------------------------------------------------------
-# STREAMLIT UI
+# STREAMLIT UI (TAB 1 & TAB 2)
 # ---------------------------------------------------------
-if __name__ == "__main__":
-    if HEADLESS_MODE:
-        run_headless_pipeline()
-        sys.exit(0)
-        
-    # Standard UI Path
-    tab1, tab2 = st.tabs(["Tab 1: Market Scanner", "Tab 2: Ticker Deep-Dive"])
+# Market Regime UI
+if is_risk_on:
+    st.success(f"**Risk-On Regime.** VIX: {vix_val:.2f} | SPY Price: {spy_price:.2f} (SMA20: {spy_sma20:.2f}). Trend Expansion highly weighted.")
+else:
+    st.error(f"**WARNING: Risk-Off Regime detected.** VIX: {vix_val:.2f} | SPY Price: {spy_price:.2f} (SMA20: {spy_sma20:.2f}). SMC and Compression heavily weighted.")
 
+tab1, tab2 = st.tabs(["Tab 1: Market Scanner", "Tab 2: Ticker Deep-Dive"])
+
+with st.sidebar:
+    st.title("Tier-1 Scanner Engine")
+    st.write("The Tier-1 scanner evaluates all tickers against 5 algorithmic engines concurrently.")
+    if st.button("Run Full Market Scan"):
+        st.session_state['run_scan'] = True
+
+if 'run_scan' in st.session_state and st.session_state['run_scan']:
     with tab1:
-        st.title("Institutional Market Scanner")
-        if st.button("Run Market Scan"):
-            with st.spinner("Executing Tier 1 Filter..."):
-                tier1_df = run_tier_1()
-                
-            if tier1_df.empty:
-                st.error("Tier 1 failed or returned no tickers.")
-            else:
-                tier2_results = []
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                rows = tier1_df.to_dict('records')
-                
-                with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-                    futures = {executor.submit(fetch_tier2_data, row, STRATEGY): row for row in rows}
-                    completed = 0
-                    for future in concurrent.futures.as_completed(futures):
-                        try: tier2_results.append(future.result())
-                        except: pass
-                        completed += 1
-                        progress_bar.progress(completed / len(rows))
-                        status_text.text(f"Processing Tier 2: {completed}/{len(rows)}")
-                        
-                if tier2_results:
-                    final_df = pd.DataFrame(tier2_results)
-                    final_df = final_df.sort_values(by='Composite Score', ascending=False)
-                    # We drop internal FVG_Details dict from dataframe view
-                    display_df = final_df.drop(columns=['FVG_Details'])
-                    st.dataframe(display_df, use_container_width=True)
-                else:
-                    st.warning("No results from Tier 2.")
-
-    with tab2:
-        st.title("Ticker Deep-Dive & Position Sizing")
-        ticker_options = [f"{k} - {v}" for k, v in tickers.TICKER_MAPPING.items()]
-        selected_option = st.selectbox(
-            "Search Ticker or Company Name...",
-            options=ticker_options,
-            index=None,
-            placeholder="Search Ticker or Company Name..."
-        )
-        
-        search_ticker = None
-        if selected_option:
-            search_ticker = selected_option.split(" - ")[0].strip()
-        
-        if search_ticker:
-            # Dynamic Position Sizing Inputs
-            col_ps1, col_ps2 = st.columns(2)
-            portfolio_size = col_ps1.number_input("Total Portfolio Size ($)", value=50000.0, step=1000.0)
-            risk_pct = col_ps2.number_input("Risk Per Trade (%)", value=1.0, step=0.1)
+        tier2_tickers = run_tier_1()
+        if not tier2_tickers:
+            st.warning("Tier 1 failed or no tickers found.")
+        else:
+            progress_bar = st.progress(0)
+            status_text = st.empty()
             
-            with st.spinner(f"Analyzing {search_ticker} against {STRATEGY}..."):
-                # Fetch actual RSI for Tab 2 to avoid hard-gating dummy penalties
-                actual_rsi = 50.0
-                try:
-                    hist_1d = yf.Ticker(search_ticker).history(period="90d", interval="1d")
-                    if not hist_1d.empty:
-                        delta = hist_1d['Close'].diff()
-                        gain = delta.clip(lower=0)
-                        loss = -1 * delta.clip(upper=0)
-                        rs = gain.ewm(com=13, adjust=False).mean() / loss.ewm(com=13, adjust=False).mean()
-                        actual_rsi = float((100 - (100 / (1 + rs))).iloc[-1])
-                except:
-                    pass
-                    
-                row = {'Ticker': search_ticker, 'RS_Base_Score': 20.0, 'RSI': actual_rsi}
-                results = fetch_tier2_data_omni(row)
+            final_results = []
+            completed = 0
+            total = len(tier2_tickers)
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                future_to_ticker = {executor.submit(evaluate_ticker_pipeline, t): t for t in tier2_tickers}
+                for future in concurrent.futures.as_completed(future_to_ticker):
+                    completed += 1
+                    status_text.text(f"Processing Tier 2: {completed}/{total}")
+                    progress_bar.progress(completed / total)
+                    try:
+                        res = future.result()
+                        if res: final_results.append(res)
+                    except:
+                        pass
+                        
+            if final_results:
+                final_df = pd.DataFrame(final_results)
+                final_df = final_df.sort_values(by='Alpha Score', ascending=False)
                 
-                # Identify Dominant Setup
-                dominant_strategy = max(results.keys(), key=lambda k: results[k]['Composite Score'])
-                dominant_res = results[dominant_strategy]
-                max_score = dominant_res['Composite Score']
+                # Format boolean columns for UI
+                for col in ['Vol Absorption', 'Squeeze Active', 'SMC Sweep/CHoCH', 'Trend Expansion', 'Catalyst']:
+                    final_df[col] = final_df[col].apply(lambda x: "✅" if x else "❌")
                 
-                if dominant_res['Earnings Risk']:
-                    st.error(f"⚠️ EARNINGS RISK: {search_ticker} reports earnings within the next 7 days. -30 Penalty Applied to all scores.")
+                display_df = final_df.drop(columns=['Details', 'Scores'])
+                st.dataframe(display_df, use_container_width=True)
+            else:
+                st.warning("No results from Tier 2.")
+
+with tab2:
+    st.title("Institutional Grade Alpha Deep-Dive")
+    ticker_options = [f"{k} - {v}" for k, v in tickers.TICKER_MAPPING.items()]
+    selected_option = st.selectbox("Search Ticker...", options=ticker_options, index=None)
+    
+    if selected_option:
+        search_ticker = selected_option.split(" - ")[0].strip()
+        
+        col_ps1, col_ps2 = st.columns(2)
+        portfolio_size = col_ps1.number_input("Total Portfolio Size ($)", value=50000.0, step=1000.0)
+        risk_pct = col_ps2.number_input("Risk Per Trade (%)", value=1.0, step=0.1)
+        
+        with st.spinner(f"Omni-Scanning {search_ticker} across all institutional engines..."):
+            res = evaluate_ticker_pipeline(search_ticker)
+            
+            if not res:
+                st.error("Failed to evaluate ticker. Not enough data.")
+            else:
+                st.subheader(f"{res['Company Name']} ({res['Ticker']}) - {res['Sector']}")
+                st.metric("Institutional Alpha Score", f"{res['Alpha Score']} / 100", help="Weighted average of all 5 engines")
                 
-                st.subheader(f"{dominant_res['Company Name']} ({dominant_res['Ticker']}) - {dominant_res['Sector']}")
+                st.markdown("### 🔍 5-Engine Matrix Breakdown")
+                cols = st.columns(5)
+                strat_names = ['Volume Absorption', 'Squeeze (4H)', 'SMC Structure', 'Macro Trend', 'Fundamental']
+                strat_keys = ['Volume', 'Squeeze', 'SMC', 'Trend', 'Fund']
                 
-                st.markdown("### 🔍 Omni-Scan Comparative Analysis")
-                cols = st.columns(len(results.keys()))
-                for i, strat in enumerate(results.keys()):
-                    score = results[strat]['Composite Score']
+                for i in range(5):
                     with cols[i]:
-                        # Shorten name for UI fit if needed
-                        display_name = strat.replace(" (Shorting)", "").replace(" ", "\n")
-                        st.metric(strat.split(" ")[0], f"{score}/100", help=strat)
+                        st.metric(strat_names[i], f"{res['Scores'][strat_keys[i]]}/100")
+                        st.caption(res['Details'][strat_keys[i]])
                 
                 st.markdown("---")
                 
-                if max_score < 70:
-                    st.warning(f"**No Dominant Institutional Setup Detected.** The highest scoring strategy was *{dominant_strategy}* at {max_score}/100. Position sizing and Take-Profit generation halted.")
+                if res['Alpha Score'] < 70:
+                    st.warning(f"**No Dominant Institutional Setup Detected.** Alpha Score: {res['Alpha Score']}/100. Position sizing restricted.")
                 else:
-                    st.success(f"**Dominant Setup Detected:** {dominant_strategy} ({max_score}/100)")
-                    
-                    st.markdown("### Technical & Fundamental Breakdown")
-                    col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("Recommendation", dominant_res['Recommendation'])
-                    col2.metric("Swept Liquidity", "Yes" if dominant_res['Swept Liquidity'] else "No")
-                    col3.metric("MSS Triggered", "Yes" if dominant_res['MSS Triggered'] else "No")
-                    col4.metric("In FVG Zone", "Yes" if dominant_res['In FVG Zone'] else "No")
+                    st.success(f"**Dominant Setup Detected!** Alpha Score: {res['Alpha Score']}/100")
                     
                     with st.expander("Institutional Exits & Position Sizing", expanded=True):
-                        fvg = dominant_res['FVG_Details']
-                        if dominant_res['In FVG Zone'] and fvg:
+                        fvg = res['Details']['FVG']
+                        if res['SMC Sweep/CHoCH'] and fvg:
                             st.write(f"**Active FVG Detected ({fvg['Type']})**")
                             entry = fvg['Top'] if fvg['Type'] == 'Bullish' else fvg['Bottom']
                             stop = fvg['Bottom'] if fvg['Type'] == 'Bullish' else fvg['Top']
@@ -663,10 +534,5 @@ if __name__ == "__main__":
                             if risk_per_share > 0:
                                 allowed_shares = int(risk_amt / risk_per_share)
                                 st.success(f"**Allowed Position Size:** {allowed_shares} shares (Risking ${risk_amt:.2f})")
-                            
-                            st.write("---")
-                            st.write("**Take-Profit Targets (Un-swept Liquidity):**")
-                            st.write(f"- **TP1:** {dominant_res['TP1']:.2f}" if dominant_res['TP1'] else "- **TP1:** None found")
-                            st.write(f"- **TP2:** {dominant_res['TP2']:.2f}" if dominant_res['TP2'] else "- **TP2:** None found")
                         else:
-                            st.write("No active Fair Value Gap zone detected for the dominant setup. Position sizing requires an FVG boundary.")
+                            st.write("No active Fair Value Gap zone detected for risk management.")
