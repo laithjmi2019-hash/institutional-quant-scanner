@@ -100,7 +100,8 @@ def calc_adx(df, period=14):
 # ---------------------------------------------------------
 def run_strategy_1_rvol(df_1d):
     if df_1d is None or len(df_1d) < 20: return 0, False, "Not enough data"
-    vol_sma = df_1d['Volume'].rolling(20).mean()
+    # 20-Day Average Volume (using min_periods=1 to handle newly listed stocks or edge cases)
+    vol_sma = df_1d['Volume'].rolling(20, min_periods=1).mean()
     current_vol = df_1d['Volume'].iloc[-1]
     current_vol_sma = vol_sma.iloc[-1]
     
@@ -348,7 +349,7 @@ def run_tier_1():
     else:
         spy_close = spy_data['Close']
         
-    spy_ret = spy_close.pct_change(60).iloc[-1]
+    spy_ret = spy_close.pct_change(60, fill_method=None).iloc[-1]
     if isinstance(spy_ret, pd.Series): spy_ret = float(spy_ret.iloc[0])
     else: spy_ret = float(spy_ret)
     
@@ -366,12 +367,12 @@ def run_tier_1():
             c = df['Close']
             v = df['Volume']
             
-            stock_ret = c.pct_change(60).iloc[-1]
+            stock_ret = c.pct_change(60, fill_method=None).iloc[-1]
             if isinstance(stock_ret, pd.Series): stock_ret = float(stock_ret.iloc[0])
             else: stock_ret = float(stock_ret)
             
             rs_score = ((stock_ret - spy_ret) / abs(spy_ret)) * 100 if spy_ret != 0 else 0
-            avg_vol = float(v.rolling(20).mean().iloc[-1])
+            avg_vol = float(v.rolling(20, min_periods=1).mean().iloc[-1])
             
             if avg_vol > 500000:
                 tier1_results.append({'Ticker': ticker, 'RS': rs_score, 'AvgVol': avg_vol})
@@ -575,7 +576,7 @@ with tab2:
                             if len(bt_data) > 100:
                                 bt_data['EMA9'] = bt_data['Close'].ewm(span=9, adjust=False).mean()
                                 bt_data['EMA21'] = bt_data['Close'].ewm(span=21, adjust=False).mean()
-                                bt_data['VolSMA'] = bt_data['Volume'].rolling(20).mean()
+                                bt_data['VolSMA'] = bt_data['Volume'].rolling(20, min_periods=1).mean()
                                 
                                 bb_up, bb_low = calc_bb(bt_data, 20, 2)
                                 kc_up, kc_low = calc_kc(bt_data, 20, 1.5)
