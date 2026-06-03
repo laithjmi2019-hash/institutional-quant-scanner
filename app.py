@@ -124,7 +124,7 @@ def run_strategy_1_rvol(df_1d):
     return score, is_absorbing, details
 
 # ---------------------------------------------------------
-# STRATEGY 2: DAILY VOLATILITY SQUEEZE
+# STRATEGY 2: DAILY VOLATILITY SQUEEZE (BONUS MULTIPLIER)
 # ---------------------------------------------------------
 def run_strategy_2_squeeze(df_1d):
     if df_1d is None or len(df_1d) < 20: return 0, False, "Not enough data"
@@ -152,7 +152,7 @@ def run_strategy_2_squeeze(df_1d):
     return score, squeeze_active, details
 
 # ---------------------------------------------------------
-# STRATEGY 3: WEEKLY ANCHORED VWAP
+# STRATEGY 3: QTD ANCHORED VWAP
 # ---------------------------------------------------------
 def run_strategy_3_avwap(df_1d):
     if df_1d is None or len(df_1d) < 10: return 0, False, "Not enough data"
@@ -161,10 +161,10 @@ def run_strategy_3_avwap(df_1d):
     df['Typical_Price'] = (df['High'] + df['Low'] + df['Close']) / 3
     df['TP_Vol'] = df['Typical_Price'] * df['Volume']
     
-    # Identify the current week (ISO week number) anchored to Monday
-    df['Week_Start'] = df.index.to_period('W-SUN').start_time
+    # Identify the current quarter anchored to the first trading day of the quarter
+    df['Quarter_Start'] = df.index.to_period('Q').start_time
     
-    grouped = df.groupby('Week_Start')
+    grouped = df.groupby('Quarter_Start')
     df['Cum_TP_Vol'] = grouped['TP_Vol'].cumsum()
     df['Cum_Vol'] = grouped['Volume'].cumsum()
     
@@ -175,16 +175,16 @@ def run_strategy_3_avwap(df_1d):
     
     score = 0
     is_above = False
-    details = "Trading Below Weekly AVWAP"
+    details = "Trading Below QTD AVWAP"
     
     if current_close > current_avwap:
         is_above = True
         distance = (current_close / current_avwap - 1) * 100
         score = 100
-        details = f"Bullish: Price above AVWAP (+{distance:.1f}%)"
+        details = f"Bullish: Price above QTD AVWAP (+{distance:.1f}%)"
     else:
         score = 0
-        details = "Bearish: Price below Weekly AVWAP"
+        details = "Bearish: Price below QTD AVWAP"
         
     return score, is_above, details
 
@@ -252,16 +252,21 @@ def run_strategy_5_fundamental(ticker, news_data):
 # ---------------------------------------------------------
 # AGGREGATION & DATA PIPELINE
 # ---------------------------------------------------------
-def aggregate_alpha_score(scores, is_risk_on):
+def aggregate_alpha_score(scores, flags_dict, is_risk_on):
     if is_risk_on:
-        weights = {'Volume': 0.25, 'Squeeze': 0.15, 'AVWAP': 0.15, 'Trend': 0.35, 'Fund': 0.10}
+        weights = {'Volume': 0.35, 'AVWAP': 0.25, 'Trend': 0.30, 'Fund': 0.10}
     else:
-        weights = {'Volume': 0.20, 'Squeeze': 0.30, 'AVWAP': 0.35, 'Trend': 0.05, 'Fund': 0.10}
+        weights = {'Volume': 0.30, 'AVWAP': 0.40, 'Trend': 0.10, 'Fund': 0.20}
         
     alpha = 0
     for k, v in weights.items():
         alpha += scores[k] * v
-    return round(alpha, 1)
+        
+    # Bonus Multiplier for Squeeze + RVOL
+    if flags_dict['Squeeze'] and flags_dict['Volume']:
+        alpha += 15
+        
+    return min(100.0, round(alpha, 1))
 
 def fetch_daily_data(ticker):
     tk = yf.Ticker(ticker)
@@ -283,8 +288,9 @@ def evaluate_ticker_pipeline(ticker):
     s4_score, s4_flag, s4_det = run_strategy_4_trend(df_1d)
     s5_score, s5_flag, s5_det = run_strategy_5_fundamental(ticker, news)
     
-    scores = {'Volume': s1_score, 'Squeeze': s2_score, 'AVWAP': s3_score, 'Trend': s4_score, 'Fund': s5_score}
-    alpha = aggregate_alpha_score(scores, is_risk_on)
+    scores = {'Volume': s1_score, 'AVWAP': s3_score, 'Trend': s4_score, 'Fund': s5_score}
+    flags_dict = {'Volume': s1_flag, 'Squeeze': s2_flag}
+    alpha = aggregate_alpha_score(scores, flags_dict, is_risk_on)
     
     rec = "AVOID"
     if alpha >= 80: rec = "STRONG BUY"
@@ -303,11 +309,11 @@ def evaluate_ticker_pipeline(ticker):
         'Recommendation': rec,
         'RVOL Spike': s1_flag,
         'Squeeze Active': s2_flag,
-        'Weekly AVWAP': s3_flag,
+        'QTD AVWAP': s3_flag,
         'Trend Expansion': s4_flag,
         'Catalyst': s5_flag,
         'Details': {'Volume': s1_det, 'Squeeze': s2_det, 'AVWAP': s3_det, 'Trend': s4_det, 'Fund': s5_det},
-        'Scores': scores,
+        'Scores': {'Volume': s1_score, 'Squeeze': s2_score, 'AVWAP': s3_score, 'Trend': s4_score, 'Fund': s5_score},
         'ATR': current_atr,
         'Current Price': current_price
     }
@@ -402,7 +408,7 @@ if HEADLESS_MODE:
 if is_risk_on:
     st.success(f"**Risk-On Regime.** VIX: {vix_val:.2f} | SPY Price: {spy_price:.2f} (SMA20: {spy_sma20:.2f}). Trend Expansion highly weighted.")
 else:
-    st.error(f"**WARNING: Risk-Off Regime detected.** VIX: {vix_val:.2f} | SPY Price: {spy_price:.2f} (SMA20: {spy_sma20:.2f}). AVWAP and Compression heavily weighted.")
+    st.error(f"**WARNING: Risk-Off Regime detected.** VIX: {vix_val:.2f} | SPY Price: {spy_price:.2f} (SMA20: {spy_sma20:.2f}). QTD AVWAP and Compression heavily weighted.")
 
 tab1, tab2, tab3 = st.tabs(["Tab 1: Market Scanner", "Tab 2: Ticker Deep-Dive", "Tab 3: Risk Sandbox"])
 
@@ -441,7 +447,7 @@ if 'run_scan' in st.session_state and st.session_state['run_scan']:
                 final_df = pd.DataFrame(final_results)
                 final_df = final_df.sort_values(by='Alpha Score', ascending=False)
                 
-                for col in ['RVOL Spike', 'Squeeze Active', 'Weekly AVWAP', 'Trend Expansion', 'Catalyst']:
+                for col in ['RVOL Spike', 'Squeeze Active', 'QTD AVWAP', 'Trend Expansion', 'Catalyst']:
                     final_df[col] = final_df[col].apply(lambda x: "✅" if x else "❌")
                 
                 display_df = final_df.drop(columns=['Details', 'Scores', 'ATR', 'Current Price'])
@@ -472,7 +478,7 @@ with tab2:
                 
                 st.markdown("### 🔍 5-Engine Matrix Breakdown")
                 cols = st.columns(5)
-                strat_names = ['Relative Vol (RVOL)', 'Daily Squeeze', 'Weekly AVWAP', 'Fast Momentum', 'Fundamental']
+                strat_names = ['Relative Vol (RVOL)', 'Daily Squeeze (+15 Bonus)', 'QTD AVWAP', 'Fast Momentum', 'Fundamental']
                 strat_keys = ['Volume', 'Squeeze', 'AVWAP', 'Trend', 'Fund']
                 
                 for i in range(5):
@@ -509,12 +515,12 @@ with tab2:
                     with st.expander("ATR Mathematical Exits & Position Sizing", expanded=True):
                         entry = res['Current Price']
                         atr = res['ATR']
-                        tp = entry + (3 * atr)
+                        tp = entry + (1.5 * atr)
                         sl = entry - (1 * atr)
                         
                         st.write(f"**14-Day ATR:** ${atr:.2f}")
                         st.write(f"**Entry Price:** ${entry:.2f}")
-                        st.markdown(f"**🟢 Take-Profit (3x ATR):** ${tp:.2f}")
+                        st.markdown(f"**🟢 Take-Profit (1.5x ATR):** ${tp:.2f}")
                         st.markdown(f"**🔴 Stop-Loss (1x ATR):** ${sl:.2f}")
                         
                         risk_amt = portfolio_size * (risk_pct / 100.0)
