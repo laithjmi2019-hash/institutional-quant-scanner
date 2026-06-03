@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import streamlit as st
+import plotly.express as px
 import tickers
 
 # ---------------------------------------------------------
@@ -428,7 +429,7 @@ if HEADLESS_MODE:
     run_headless_pipeline()
 
 # ---------------------------------------------------------
-# STREAMLIT UI (TAB 1 & TAB 2)
+# STREAMLIT UI (TAB 1, TAB 2 & TAB 3)
 # ---------------------------------------------------------
 # Market Regime UI
 if is_risk_on:
@@ -436,7 +437,7 @@ if is_risk_on:
 else:
     st.error(f"**WARNING: Risk-Off Regime detected.** VIX: {vix_val:.2f} | SPY Price: {spy_price:.2f} (SMA20: {spy_sma20:.2f}). SMC and Compression heavily weighted.")
 
-tab1, tab2 = st.tabs(["Tab 1: Market Scanner", "Tab 2: Ticker Deep-Dive"])
+tab1, tab2, tab3 = st.tabs(["Tab 1: Market Scanner", "Tab 2: Ticker Deep-Dive", "Tab 3: Risk Sandbox"])
 
 with st.sidebar:
     st.title("Tier-1 Scanner Engine")
@@ -473,7 +474,6 @@ if 'run_scan' in st.session_state and st.session_state['run_scan']:
                 final_df = pd.DataFrame(final_results)
                 final_df = final_df.sort_values(by='Alpha Score', ascending=False)
                 
-                # Format boolean columns for UI
                 for col in ['Vol Absorption', 'Squeeze Active', 'SMC Sweep/CHoCH', 'Trend Expansion', 'Catalyst']:
                     final_df[col] = final_df[col].apply(lambda x: "✅" if x else "❌")
                 
@@ -513,6 +513,25 @@ with tab2:
                         st.metric(strat_names[i], f"{res['Scores'][strat_keys[i]]}/100")
                         st.caption(res['Details'][strat_keys[i]])
                 
+                # Passive Sector Velocity Sidebar Widget
+                sector = res['Sector']
+                SECTOR_ETF_MAP = {'Technology': 'XLK', 'Healthcare': 'XLV', 'Financial Services': 'XLF', 'Consumer Cyclical': 'XLY', 'Communication Services': 'XLC', 'Industrials': 'XLI', 'Consumer Defensive': 'XLP', 'Energy': 'XLE', 'Utilities': 'XLU', 'Real Estate': 'XLRE', 'Basic Materials': 'XLB'}
+                etf = SECTOR_ETF_MAP.get(sector)
+                if etf:
+                    try:
+                        etf_data = yf.download(etf, period="20d", interval="1d", auto_adjust=False, progress=False)
+                        etf_ret = (etf_data['Close'].iloc[-1] / etf_data['Close'].iloc[-10] - 1) * 100
+                        etf_ret = float(etf_ret.iloc[0]) if isinstance(etf_ret, pd.Series) else float(etf_ret)
+                        color = "green" if etf_ret > 0 else "red"
+                        
+                        st.sidebar.markdown("---")
+                        st.sidebar.markdown("### 🌐 Macro Sector Context")
+                        st.sidebar.markdown(f"**Sector:** {sector} ({etf})")
+                        st.sidebar.markdown(f"**10-Day Capital Flow:** <span style='color:{color}; font-weight:bold'>{etf_ret:.2f}%</span>", unsafe_allow_html=True)
+                        st.sidebar.caption("Note: Sector velocity does not impact the Alpha Score. Displayed for passive macro context only.")
+                    except:
+                        pass
+
                 st.markdown("---")
                 
                 if res['Alpha Score'] < 70:
@@ -536,3 +555,117 @@ with tab2:
                                 st.success(f"**Allowed Position Size:** {allowed_shares} shares (Risking ${risk_amt:.2f})")
                         else:
                             st.write("No active Fair Value Gap zone detected for risk management.")
+                            
+                # Isolated Automated Backtester
+                st.markdown("---")
+                st.markdown("### 🤖 Automated Historical Backtester")
+                st.write("Run a 2-year vectorized historical simulation to validate the statistical edge of this setup.")
+                if st.button("Run Historical Simulation (2-Year Vectorized)"):
+                    with st.spinner("Running vectorized historical backtest..."):
+                        try:
+                            bt_data = yf.download(search_ticker, period="2y", interval="1d", auto_adjust=False, progress=False)
+                            if len(bt_data) > 100:
+                                bt_data['EMA50'] = bt_data['Close'].ewm(span=50, adjust=False).mean()
+                                bt_data['VolSMA'] = bt_data['Volume'].rolling(30).mean()
+                                
+                                atr, _ = calc_atr(bt_data, 14)
+                                adx, pdi, ndi = calc_adx(bt_data, 14)
+                                
+                                bb_up, bb_low = calc_bb(bt_data, 20, 2)
+                                kc_up, kc_low = calc_kc(bt_data, 20, 1.5)
+                                squeeze = (bb_up < kc_up) & (bb_low > kc_low)
+                                
+                                if isinstance(adx, pd.DataFrame):
+                                    adx = adx.iloc[:, 0]
+                                    pdi = pdi.iloc[:, 0]
+                                    ndi = ndi.iloc[:, 0]
+                                    
+                                signal = (bt_data['Close'].iloc[:, 0] > bt_data['EMA50'].iloc[:, 0]) & (adx > 25) & (pdi > ndi) & ((bt_data['Volume'].iloc[:, 0] > 2 * bt_data['VolSMA'].iloc[:, 0]) | squeeze.iloc[:, 0])
+                                
+                                bt_data['Signal'] = signal
+                                bt_data['Fwd_Ret_10d'] = bt_data['Close'].iloc[:, 0].shift(-10) / bt_data['Close'].iloc[:, 0] - 1
+                                
+                                trades = bt_data[bt_data['Signal'] & (~bt_data['Signal'].shift(1).fillna(False))].dropna(subset=['Fwd_Ret_10d'])
+                                
+                                if len(trades) > 0:
+                                    win_rate = (trades['Fwd_Ret_10d'] > 0).mean() * 100
+                                    avg_ret = trades['Fwd_Ret_10d'].mean() * 100
+                                    max_dd = trades['Fwd_Ret_10d'].min() * 100
+                                    
+                                    st.info(f"**Historical Simulation Complete (2-Year)**\n\nIdentified **{len(trades)}** structural setups in the past 24 months matching these dynamics.\n- **Win Rate (10-Day Hold):** {win_rate:.1f}%\n- **Average Return per Trade:** {avg_ret:.2f}%\n- **Max Drawdown (Worst Trade):** {max_dd:.2f}%")
+                                else:
+                                    st.warning("No historical setups matched this strict Institutional Grade criteria in the last 2 years.")
+                            else:
+                                st.warning("Not enough historical data to run backtest.")
+                        except Exception as e:
+                            st.error(f"Backtest failed: {e}")
+
+with tab3:
+    st.title("Pre-Trade Portfolio Risk Sandbox")
+    st.write("Analyze your current portfolio against staged scanner picks to identify critical systemic risk correlations.")
+    
+    col1, col2 = st.columns(2)
+    active_port = col1.text_input("Active Portfolio Tickers (comma separated)", "AAPL, MSFT")
+    
+    stage_options = [f"{k} - {v}" for k, v in tickers.TICKER_MAPPING.items()]
+    staged_picks = col2.multiselect("Stage Pending Scanner Picks", options=stage_options)
+    
+    if st.button("Run Risk Matrix"):
+        with st.spinner("Calculating Covariance and Risk Parity..."):
+            port_tickers = [t.strip().upper() for t in active_port.split(",") if t.strip()]
+            staged_tickers = [t.split(" - ")[0].strip() for t in staged_picks]
+            
+            all_tickers = list(set(port_tickers + staged_tickers))
+            
+            if len(all_tickers) < 2:
+                st.warning("Please enter at least 2 valid tickers to calculate correlation.")
+            else:
+                try:
+                    data = yf.download(all_tickers, period="60d", interval="1d", group_by='ticker', auto_adjust=False, progress=False)
+                    closes = pd.DataFrame()
+                    
+                    if len(all_tickers) == 1:
+                        st.warning("Need 2+ tickers to correlate.")
+                    else:
+                        for t in all_tickers:
+                            if isinstance(data.columns, pd.MultiIndex):
+                                if t in data['Close']:
+                                    closes[t] = data['Close'][t]
+                            else:
+                                pass # Should not happen with multiple tickers
+                                
+                        closes = closes.dropna()
+                        log_returns = np.log(closes / closes.shift(1)).dropna()
+                        
+                        corr_matrix = log_returns.corr()
+                        
+                        st.subheader("Pearson Correlation Heatmap (60-Day)")
+                        fig = px.imshow(corr_matrix, text_auto=".2f", color_continuous_scale='RdBu_r', zmin=-1, zmax=1, aspect="auto")
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        high_corr_pairs = []
+                        for i in range(len(corr_matrix.columns)):
+                            for j in range(i+1, len(corr_matrix.columns)):
+                                if corr_matrix.iloc[i, j] > 0.85:
+                                    high_corr_pairs.append((corr_matrix.columns[i], corr_matrix.columns[j], corr_matrix.iloc[i, j]))
+                                    
+                        if high_corr_pairs:
+                            st.error("🚨 **SYSTEMIC RISK DETECTED** 🚨")
+                            for p in high_corr_pairs:
+                                st.write(f"- **{p[0]}** and **{p[1]}** have an extreme correlation of **{p[2]:.2f}**. Buying both provides zero diversification and doubles your downside risk.")
+                        else:
+                            st.success("✅ No extreme correlations (> 0.85) detected. Portfolio risk is distributed.")
+                            
+                        st.markdown("### Risk Parity Position Sizing")
+                        st.write("Suggested capital allocation based on inverse volatility (targeting equal risk contribution):")
+                        vols = log_returns.std() * np.sqrt(252)
+                        inv_vols = 1.0 / vols
+                        risk_parity_weights = inv_vols / inv_vols.sum()
+                        
+                        rp_df = pd.DataFrame({
+                            'Annualized Volatility': vols.apply(lambda x: f"{x*100:.1f}%"),
+                            'Suggested Allocation': risk_parity_weights.apply(lambda x: f"{x*100:.1f}%")
+                        })
+                        st.dataframe(rp_df.sort_values(by='Suggested Allocation', ascending=False))
+                except Exception as e:
+                    st.error(f"Failed to calculate risk matrix: {e}")
