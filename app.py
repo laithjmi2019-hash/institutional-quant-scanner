@@ -341,7 +341,7 @@ def evaluate_ticker_pipeline(ticker):
         'SMC Sweep/CHoCH': s3_flag,
         'Trend Expansion': s4_flag,
         'Catalyst': s5_flag,
-        'Details': {'Vol': s1_det, 'Squeeze': s2_det, 'SMC': s3_str, 'Trend': s4_det, 'Fund': s5_det, 'FVG': fvg_det},
+        'Details': {'Volume': s1_det, 'Squeeze': s2_det, 'SMC': s3_str, 'Trend': s4_det, 'Fund': s5_det, 'FVG': fvg_det},
         'Scores': scores
     }
 
