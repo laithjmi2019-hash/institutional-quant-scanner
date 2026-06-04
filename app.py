@@ -49,15 +49,15 @@ def get_market_regime():
         
         vix_val = float(vix_df['Close'].iloc[-1].iloc[0]) if isinstance(vix_df['Close'], pd.DataFrame) else float(vix_df['Close'].iloc[-1])
         spy_price = float(spy_df['Close'].iloc[-1].iloc[0]) if isinstance(spy_df['Close'], pd.DataFrame) else float(spy_df['Close'].iloc[-1])
-        spy_sma20 = float(spy_df['Close'].rolling(20).mean().iloc[-1].iloc[0]) if isinstance(spy_df['Close'], pd.DataFrame) else float(spy_df['Close'].rolling(20).mean().iloc[-1])
+        spy_sma50 = float(spy_df['Close'].rolling(50, min_periods=1).mean().iloc[-1].iloc[0]) if isinstance(spy_df['Close'], pd.DataFrame) else float(spy_df['Close'].rolling(50, min_periods=1).mean().iloc[-1])
         
-        is_risk_on = (vix_val <= 25) and (spy_price >= spy_sma20)
-        return vix_val, spy_price, spy_sma20, is_risk_on
+        is_risk_on = (vix_val <= 25) and (spy_price >= spy_sma50)
+        return vix_val, spy_price, spy_sma50, is_risk_on
     except Exception as e:
         print(f"Market regime fetch failed: {e}")
         return 0.0, 0.0, 0.0, True
 
-vix_val, spy_price, spy_sma20, is_risk_on = get_market_regime()
+vix_val, spy_price, spy_sma50, is_risk_on = get_market_regime()
 
 # ---------------------------------------------------------
 # VECTORIZED MATH INDICATORS
@@ -296,6 +296,27 @@ def evaluate_ticker_pipeline(ticker, preloaded_df=None):
         
     if df_1d is None or len(df_1d) < 200: return None
     
+    # Pre-Calculation Gate: Dollar Volume >= $1,000,000
+    vol_sma = float(df_1d['Volume'].rolling(20, min_periods=1).mean().iloc[-1])
+    current_price = float(df_1d['Close'].iloc[-1])
+    dollar_vol = vol_sma * current_price
+    if dollar_vol < 1_000_000:
+        return None
+        
+    # Phase 7: Gap-Type Classification
+    today_open = float(df_1d['Open'].iloc[-1])
+    prior_close = float(df_1d['Close'].iloc[-2]) if len(df_1d) > 1 else today_open
+    gap_pct = ((today_open - prior_close) / prior_close) * 100
+    
+    today_high = float(df_1d['High'].iloc[-1])
+    today_low = float(df_1d['Low'].iloc[-1])
+    if today_high - today_low > 0:
+        body_strength = (current_price - today_low) / (today_high - today_low)
+    else:
+        body_strength = 0
+        
+    setup_type = "Gap & Go Setup" if gap_pct >= 3.0 and body_strength >= 0.70 else "Standard"
+    
     s1_score, s1_flag, s1_det = run_strategy_1_rvol(df_1d)
     s2_score, s2_flag, s2_det = run_strategy_2_squeeze(df_1d)
     s3_score, s3_flag, s3_det = run_strategy_3_avwap(df_1d)
@@ -321,6 +342,8 @@ def evaluate_ticker_pipeline(ticker, preloaded_df=None):
         'Sector': sector,
         'Alpha Score': alpha,
         'Recommendation': rec,
+        'Gap %': round(gap_pct, 2),
+        'Setup Type': setup_type,
         'RVOL Spike': s1_flag,
         'Squeeze Active': s2_flag,
         'QTD AVWAP': s3_flag,
@@ -335,7 +358,8 @@ def evaluate_ticker_pipeline(ticker, preloaded_df=None):
         },
         'Scores': {'Volume': s1_score, 'Squeeze': s2_score, 'AVWAP': s3_score, 'Trend': s4_score, 'Fund': 0},
         'ATR': current_atr,
-        'Current Price': current_price
+        'Current Price': current_price,
+        'Dollar Volume': dollar_vol
     }
 
 # ---------------------------------------------------------
@@ -440,9 +464,9 @@ if HEADLESS_MODE:
 # ---------------------------------------------------------
 # Market Regime UI
 if is_risk_on:
-    st.success(f"**Risk-On Regime.** VIX: {vix_val:.2f} | SPY Price: {spy_price:.2f} (SMA20: {spy_sma20:.2f}). Trend Expansion highly weighted.")
+    st.success(f"**🟢 Risk-On Regime.** VIX: {vix_val:.2f} | SPY Price: {spy_price:.2f} (SMA50: {spy_sma50:.2f}). Systemic Risk is LOW.")
 else:
-    st.error(f"**WARNING: Risk-Off Regime detected.** VIX: {vix_val:.2f} | SPY Price: {spy_price:.2f} (SMA20: {spy_sma20:.2f}). QTD AVWAP and Compression heavily weighted.")
+    st.error(f"**🔴 WARNING: Risk-Off Regime detected (SYSTEMIC_RISK = HIGH).** VIX: {vix_val:.2f} | SPY Price: {spy_price:.2f} (SMA50: {spy_sma50:.2f}). Capital Allocation Reduced by 50%.")
 
 tab1, tab2, tab3 = st.tabs(["Tab 1: Market Scanner", "Tab 2: Ticker Deep-Dive", "Tab 3: Risk Sandbox"])
 
@@ -578,6 +602,10 @@ with tab2:
                         st.markdown(f"**🔴 Stop-Loss (1x ATR):** ${sl:.2f}")
                         
                         risk_amt = portfolio_size * (risk_pct / 100.0)
+                        if not is_risk_on:
+                            risk_amt *= 0.5
+                            st.warning("⚠️ **SYSTEMIC RISK HIGH:** Recommended Risk Allocation mathematically slashed by 50% to preserve capital.")
+                            
                         risk_per_share = abs(entry - sl)
                         if risk_per_share > 0:
                             allowed_shares = int(risk_amt / risk_per_share)
