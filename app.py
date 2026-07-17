@@ -18,8 +18,8 @@ from engines.technical_structure import compute_technical_structure
 from engines.split_adjuster import adjust_for_splits
 from engines.market_scanner import init_db, save_scan_results, get_latest_scans, load_sector_cache, generate_sector_cache
 from engines.portfolio_engine import optimize_portfolio
-from app.components.state_sync import fetch_portfolio_state, sync_portfolio_state
-from app.utils.webhook_dispatcher import dispatch_trade_signal
+from core.components.state_sync import fetch_portfolio_state, sync_portfolio_state
+from core.utils.webhook_dispatcher import dispatch_trade_signal
 from data.tickers import ALL_TICKERS
 
 
