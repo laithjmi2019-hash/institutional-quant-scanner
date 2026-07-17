@@ -34,18 +34,12 @@ def compute_technical_structure(df: pd.DataFrame) -> dict:
     avwap_distance = ((current_close - current_avwap) / current_avwap) * 100
     
     # 3. Hybrid RVOL
-    # RVOL = V_today / (V_20D_Avg * Session Elapsed Ratio)
+    # RVOL = V_today / V_20D_Avg
+    # Use the rolling mean up to but not including today to avoid self-reference bias
     v_today = df['Volume'].iloc[-1]
-    v_20d_avg = df['Volume'].rolling(20, min_periods=1).mean().iloc[-2] # using iloc[-2] so today doesn't skew average
+    v_20d_avg = df['Volume'].iloc[:-1].rolling(20, min_periods=5).mean().iloc[-1]
     
-    # Approximate Session Elapsed Ratio
-    # If during market hours (9:30 AM to 4:00 PM EST)
-    now = datetime.datetime.now()
-    # For EOD scanner, assume 1.0. If live, calculate ratio.
-    # To keep it robust without timezone complexities, we'll assume 1.0 for End-of-Day data.
-    session_elapsed_ratio = 1.0 
-    
-    rvol = v_today / (v_20d_avg * session_elapsed_ratio) if v_20d_avg > 0 else 0
+    rvol = v_today / v_20d_avg if (v_20d_avg > 0 and not pd.isna(v_20d_avg)) else 0
     
     return {
         'rsi': round(current_rsi, 2) if not np.isnan(current_rsi) else 0.0,

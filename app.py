@@ -43,25 +43,34 @@ def run_scanner():
             if df.empty:
                 return None
 
-            df = adjust_for_splits(df)
-            tech = compute_technical_structure(df)
+            # Flatten MultiIndex columns from yfinance
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
 
-            if tech['rvol'] < 1.0 or tech['avwap_distance'] < 0:
+            if len(df) < 60:
                 return None
 
+            df = adjust_for_splits(df)
+            tech = compute_technical_structure(df)
             bq = compute_business_quality(ticker)
             dcf = compute_dcf_valuation(ticker)
+
+            # Fundamental Quality Gate: must have positive ROIC (profitable capital allocation)
+            if bq['roic'] <= 0:
+                return None
 
             return {
                 'scan_date': datetime.datetime.now().date(),
                 'ticker': ticker,
-                'close_price': float(df['Close'].iloc[-1]),
-                'volume': float(df['Volume'].iloc[-1]),
+                'close_price': round(float(df['Close'].iloc[-1]), 2),
+                'volume': int(df['Volume'].iloc[-1]),
                 'rvol': tech['rvol'],
                 'avwap_distance': tech['avwap_distance'],
+                'rsi': tech['rsi'],
                 'roic': bq['roic'],
                 'fcf_yield': bq['fcf_yield'],
                 'dcf_valuation': dcf['intrinsic_value'],
+                'margin_of_safety': dcf['margin_of_safety'],
                 'rc_weight': 0.0
             }
         except Exception:
